@@ -1,6 +1,6 @@
 import express from 'express';
 import { WebSocketServer } from 'ws';
-import { createClient } from 'redis';
+import { createClient, RedisClientType } from 'redis';
 import { PrismaClient } from '@prisma/client';
 
 const app = express();
@@ -11,9 +11,21 @@ const httpserver = app.listen(8080, () => {
 // Initialize WebSocket server
 const socket = new WebSocketServer({ server: httpserver });
 
-// Create Redis client and handle connection errors
-const redis = createClient({ url: 'redis://127.0.0.1:6379' });
-redis.on('error', (err) => console.error('Redis Client Error', err));
+// Create Redis client
+const redis: RedisClientType = createClient({ url: 'redis://127.0.0.1:6379' });
+
+(async () => {
+  try {
+    await redis.connect();
+    console.log('Redis client connected successfully');
+    ingestDataFromRedis(); // Start background ingestion after connection
+  } catch (err) {
+    console.error('Failed to connect to Redis:', err);
+  }
+})();
+
+// Handle Redis connection errors
+redis.on('error', (err) => console.error('Redis Client Error:', err));
 
 // Create Prisma client
 const prisma = new PrismaClient();
@@ -26,74 +38,54 @@ interface IoTData {
 
 // Simple data validation function
 function isValidData(data: IoTData): boolean {
-  return !!data.timestamp && typeof data.value === 'number'; 
+  return !!data.timestamp && typeof data.value === 'number';
 }
-
-(async () => {
-  try {
-    await redis.connect();
-    console.log('Connected to Redis');
-
-    // Start ingesting Redis stream data into PostgreSQL
-    await ingestDataFromRedis();
-  } catch (error) {
-    console.error('Redis connection error:', error);
-  }
-})();
 
 // Function to ingest data from Redis stream into PostgreSQL
 async function ingestDataFromRedis() {
   const streamName = 'iot-data';
-  let lastId = '0'; // Start reading from the beginning
+  let lastId = '0'; // Start from the beginning
+
+  console.log('Started Redis ingestion process');
 
   while (true) {
     try {
-      // Read messages from Redis stream
+      // Read multiple messages from Redis stream
       const messages = await redis.xRead(
         { key: streamName, id: lastId },
-        { BLOCK: 0, COUNT: 1 } // Block until new messages arrive
+        { BLOCK: 5000, COUNT: 10 } // Block for 5 seconds or until 10 messages arrive
       );
 
-      // Check if messages are returned and process them
       if (messages && messages.length > 0) {
         for (const message of messages) {
-          const streamName = message.name; // Extract stream name if needed
+          const streamName = message.name;
           
-          // Iterate over the inner messages
           for (const entry of message.messages) {
-            const id = entry.id; // Message ID
-            const data = entry.message; // The actual message data
+            const id = entry.id;
+            const data = entry.message;
 
-            // Extracting timestamp and value from the message data
-            const timestamp = data.timestamp; // Adjust this according to your keys
-            const value = Number(data.value); // Adjust this according to your keys
+            const timestamp = data.timestamp;
+            const value = Number(data.value);
 
-            const ioTData: IoTData = {
-              timestamp: timestamp,
-              value: value,
-            };
+            const ioTData: IoTData = { timestamp, value };
 
-            // Log the entire flow
-            console.log(`Data coming from Redis: ${JSON.stringify(ioTData)}`);
+            console.log(`Data from Redis: ${JSON.stringify(ioTData)}`);
 
-            // Validate and store in PostgreSQL
             if (isValidData(ioTData)) {
               await prisma.iotData.create({
                 data: {
-                  timestamp: new Date(ioTData.timestamp), // Ensure the timestamp is in a Date format
+                  timestamp: new Date(ioTData.timestamp),
                   value: ioTData.value,
                 },
               });
               console.log('Data saved to PostgreSQL:', ioTData);
 
-              // Update lastId to mark the last processed message
+              // Update lastId and delete processed message
               lastId = id;
-
-              // Delete the message from the Redis stream after processing
-              await redis.xDel(streamName, id); // Delete the processed message
-              console.log(`Deleted message with ID ${id} from stream ${streamName}`);
+              await redis.xDel(streamName, id);
+              console.log(`Deleted message ID ${id} from stream ${streamName}`);
             } else {
-              console.warn('Invalid data received:', ioTData);
+              console.warn('Invalid data:', ioTData);
             }
           }
         }
@@ -107,36 +99,50 @@ async function ingestDataFromRedis() {
 // WebSocket connection handler
 socket.on('connection', (client) => {
   console.log('WebSocket client connected');
-
+  
   client.on('error', console.error);
 
-  // Handle incoming messages from clients
   client.on('message', async (message: Buffer | string) => {
     try {
-      const parsedMessage = typeof message === 'string' ? message : message.toString(); // Convert to string if necessary
-      const data: IoTData = JSON.parse(parsedMessage); // Parse JSON
+      const parsedMessage = typeof message === 'string' ? message : message.toString();
+      const data: IoTData = JSON.parse(parsedMessage);
 
-      // Log the data received from the WebSocket client
-      console.log(`Data coming from WebSocket: ${parsedMessage}`);
+      console.log(`Data from WebSocket: ${parsedMessage}`);
 
       if (isValidData(data)) {
-        // 1. Store data in Redis Stream
-        console.log(data);
-
-        await redis.xAdd('iot-data', '*', {
-          timestamp: data.timestamp,
-          value: data.value.toString(),
-        });
+        console.log('Storing data to Redis stream...');
         
+        if (!redis.isOpen) {
+          console.error('Redis is not connected. Reconnecting...');
+          await redis.connect();
+        }
+
+        try {
+          const result = await redis.xAdd('iot-data', '*', {
+            timestamp: data.timestamp,
+            value: data.value.toString(),
+          });
+          console.log('Redis XADD result:', result);
+        } catch (error) {
+          console.error('Error adding to Redis stream:', error);
+        }
+
         console.log('Data added to Redis Stream:', data);
       } else {
-        console.warn('Invalid data received from WebSocket:', data);
+        console.warn('Invalid data received:', data);
       }
 
-      // Send a message to the client
       client.send('Message from server');
     } catch (err) {
       console.error('Error processing message:', err);
     }
   });
+});
+
+// Gracefully handle server shutdown
+process.on('SIGINT', async () => {
+  console.log('Closing Redis and Prisma connections...');
+  await redis.quit();
+  await prisma.$disconnect();
+  process.exit(0);
 });

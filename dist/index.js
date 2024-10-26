@@ -22,70 +22,62 @@ const httpserver = app.listen(8080, () => {
 });
 // Initialize WebSocket server
 const socket = new ws_1.WebSocketServer({ server: httpserver });
-// Create Redis client and handle connection errors
+// Create Redis client
 const redis = (0, redis_1.createClient)({ url: 'redis://127.0.0.1:6379' });
-redis.on('error', (err) => console.error('Redis Client Error', err));
+(() => __awaiter(void 0, void 0, void 0, function* () {
+    try {
+        yield redis.connect();
+        console.log('Redis client connected successfully');
+        ingestDataFromRedis(); // Start background ingestion after connection
+    }
+    catch (err) {
+        console.error('Failed to connect to Redis:', err);
+    }
+}))();
+// Handle Redis connection errors
+redis.on('error', (err) => console.error('Redis Client Error:', err));
 // Create Prisma client
 const prisma = new client_1.PrismaClient();
 // Simple data validation function
 function isValidData(data) {
     return !!data.timestamp && typeof data.value === 'number';
 }
-(() => __awaiter(void 0, void 0, void 0, function* () {
-    try {
-        yield redis.connect();
-        console.log('Connected to Redis');
-        // Start ingesting Redis stream data into PostgreSQL
-        yield ingestDataFromRedis();
-    }
-    catch (error) {
-        console.error('Redis connection error:', error);
-    }
-}))();
 // Function to ingest data from Redis stream into PostgreSQL
 function ingestDataFromRedis() {
     return __awaiter(this, void 0, void 0, function* () {
         const streamName = 'iot-data';
-        let lastId = '0'; // Start reading from the beginning
+        let lastId = '0'; // Start from the beginning
+        console.log('Started Redis ingestion process');
         while (true) {
             try {
-                // Read messages from Redis stream
-                const messages = yield redis.xRead({ key: streamName, id: lastId }, { BLOCK: 0, COUNT: 1 } // Block until new messages arrive
+                // Read multiple messages from Redis stream
+                const messages = yield redis.xRead({ key: streamName, id: lastId }, { BLOCK: 5000, COUNT: 10 } // Block for 5 seconds or until 10 messages arrive
                 );
-                // Check if messages are returned and process them
                 if (messages && messages.length > 0) {
                     for (const message of messages) {
-                        const streamName = message.name; // Extract stream name if needed
-                        // Iterate over the inner messages
+                        const streamName = message.name;
                         for (const entry of message.messages) {
-                            const id = entry.id; // Message ID
-                            const data = entry.message; // The actual message data
-                            // Extracting timestamp and value from the message data
-                            const timestamp = data.timestamp; // Adjust this according to your keys
-                            const value = Number(data.value); // Adjust this according to your keys
-                            const ioTData = {
-                                timestamp: timestamp,
-                                value: value,
-                            };
-                            // Log the entire flow
-                            console.log(`Data coming from Redis: ${JSON.stringify(ioTData)}`);
-                            // Validate and store in PostgreSQL
+                            const id = entry.id;
+                            const data = entry.message;
+                            const timestamp = data.timestamp;
+                            const value = Number(data.value);
+                            const ioTData = { timestamp, value };
+                            console.log(`Data from Redis: ${JSON.stringify(ioTData)}`);
                             if (isValidData(ioTData)) {
                                 yield prisma.iotData.create({
                                     data: {
-                                        timestamp: new Date(ioTData.timestamp), // Ensure the timestamp is in a Date format
+                                        timestamp: new Date(ioTData.timestamp),
                                         value: ioTData.value,
                                     },
                                 });
                                 console.log('Data saved to PostgreSQL:', ioTData);
-                                // Update lastId to mark the last processed message
+                                // Update lastId and delete processed message
                                 lastId = id;
-                                // Delete the message from the Redis stream after processing
-                                yield redis.xDel(streamName, id); // Delete the processed message
-                                console.log(`Deleted message with ID ${id} from stream ${streamName}`);
+                                yield redis.xDel(streamName, id);
+                                console.log(`Deleted message ID ${id} from stream ${streamName}`);
                             }
                             else {
-                                console.warn('Invalid data received:', ioTData);
+                                console.warn('Invalid data:', ioTData);
                             }
                         }
                     }
@@ -101,24 +93,32 @@ function ingestDataFromRedis() {
 socket.on('connection', (client) => {
     console.log('WebSocket client connected');
     client.on('error', console.error);
-    // Handle incoming messages from clients
     client.on('message', (message) => __awaiter(void 0, void 0, void 0, function* () {
         try {
-            const parsedMessage = typeof message === 'string' ? message : message.toString(); // Convert to string if necessary
-            const data = JSON.parse(parsedMessage); // Parse JSON
-            // Log the data received from the WebSocket client
-            console.log(`Data coming from WebSocket: ${parsedMessage}`);
-            // 1. Store data in Redis Stream
-            console.log(data);
-            yield redis.xAdd('iot-data', '*', {
-                timestamp: data.timestamp,
-                value: data.value.toString(),
-            });
-            console.log('Data added to Redis Stream:', data);
-            {
-                console.warn('Invalid data received from WebSocket:', data);
+            const parsedMessage = typeof message === 'string' ? message : message.toString();
+            const data = JSON.parse(parsedMessage);
+            console.log(`Data from WebSocket: ${parsedMessage}`);
+            if (isValidData(data)) {
+                console.log('Storing data to Redis stream...');
+                if (!redis.isOpen) {
+                    console.error('Redis is not connected. Reconnecting...');
+                    yield redis.connect();
+                }
+                try {
+                    const result = yield redis.xAdd('iot-data', '*', {
+                        timestamp: data.timestamp,
+                        value: data.value.toString(),
+                    });
+                    console.log('Redis XADD result:', result);
+                }
+                catch (error) {
+                    console.error('Error adding to Redis stream:', error);
+                }
+                console.log('Data added to Redis Stream:', data);
             }
-            // Send a message to the client
+            else {
+                console.warn('Invalid data received:', data);
+            }
             client.send('Message from server');
         }
         catch (err) {
@@ -126,3 +126,10 @@ socket.on('connection', (client) => {
         }
     }));
 });
+// Gracefully handle server shutdown
+process.on('SIGINT', () => __awaiter(void 0, void 0, void 0, function* () {
+    console.log('Closing Redis and Prisma connections...');
+    yield redis.quit();
+    yield prisma.$disconnect();
+    process.exit(0);
+}));
