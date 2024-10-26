@@ -14,7 +14,8 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
 Object.defineProperty(exports, "__esModule", { value: true });
 const express_1 = __importDefault(require("express"));
 const ws_1 = require("ws");
-const redis_1 = require("redis"); // ESM import for Redis
+const redis_1 = require("redis");
+const client_1 = require("@prisma/client");
 const app = (0, express_1.default)();
 const httpserver = app.listen(8080, () => {
     console.log('Server is running on port 8080');
@@ -22,49 +23,106 @@ const httpserver = app.listen(8080, () => {
 // Initialize WebSocket server
 const socket = new ws_1.WebSocketServer({ server: httpserver });
 // Create Redis client and handle connection errors
-const redis = (0, redis_1.createClient)();
+const redis = (0, redis_1.createClient)({ url: 'redis://127.0.0.1:6379' });
 redis.on('error', (err) => console.error('Redis Client Error', err));
+// Create Prisma client
+const prisma = new client_1.PrismaClient();
+// Simple data validation function
+function isValidData(data) {
+    return !!data.timestamp && typeof data.value === 'number';
+}
 (() => __awaiter(void 0, void 0, void 0, function* () {
     try {
         yield redis.connect();
         console.log('Connected to Redis');
+        // Start ingesting Redis stream data into PostgreSQL
+        yield ingestDataFromRedis();
     }
     catch (error) {
         console.error('Redis connection error:', error);
     }
 }))();
-// Express route handler
-app.get('/', (req, res) => {
-    res.send('Hi there! This is the Express server.');
-});
+// Function to ingest data from Redis stream into PostgreSQL
+function ingestDataFromRedis() {
+    return __awaiter(this, void 0, void 0, function* () {
+        const streamName = 'iot-data';
+        let lastId = '0'; // Start reading from the beginning
+        while (true) {
+            try {
+                // Read messages from Redis stream
+                const messages = yield redis.xRead({ key: streamName, id: lastId }, { BLOCK: 0, COUNT: 1 } // Block until new messages arrive
+                );
+                // Check if messages are returned and process them
+                if (messages && messages.length > 0) {
+                    for (const message of messages) {
+                        const streamName = message.name; // Extract stream name if needed
+                        // Iterate over the inner messages
+                        for (const entry of message.messages) {
+                            const id = entry.id; // Message ID
+                            const data = entry.message; // The actual message data
+                            // Extracting timestamp and value from the message data
+                            const timestamp = data.timestamp; // Adjust this according to your keys
+                            const value = Number(data.value); // Adjust this according to your keys
+                            const ioTData = {
+                                timestamp: timestamp,
+                                value: value,
+                            };
+                            // Log the entire flow
+                            console.log(`Data coming from Redis: ${JSON.stringify(ioTData)}`);
+                            // Validate and store in PostgreSQL
+                            if (isValidData(ioTData)) {
+                                yield prisma.iotData.create({
+                                    data: {
+                                        timestamp: new Date(ioTData.timestamp), // Ensure the timestamp is in a Date format
+                                        value: ioTData.value,
+                                    },
+                                });
+                                console.log('Data saved to PostgreSQL:', ioTData);
+                                // Update lastId to mark the last processed message
+                                lastId = id;
+                                // Delete the message from the Redis stream after processing
+                                yield redis.xDel(streamName, id); // Delete the processed message
+                                console.log(`Deleted message with ID ${id} from stream ${streamName}`);
+                            }
+                            else {
+                                console.warn('Invalid data received:', ioTData);
+                            }
+                        }
+                    }
+                }
+            }
+            catch (err) {
+                console.error('Error reading from Redis stream:', err);
+            }
+        }
+    });
+}
 // WebSocket connection handler
 socket.on('connection', (client) => {
+    console.log('WebSocket client connected');
     client.on('error', console.error);
     // Handle incoming messages from clients
     client.on('message', (message) => __awaiter(void 0, void 0, void 0, function* () {
         try {
             const parsedMessage = typeof message === 'string' ? message : message.toString(); // Convert to string if necessary
             const data = JSON.parse(parsedMessage); // Parse JSON
-            if (isValidData(data)) {
-                yield redis.xAdd('iot-data', '*', {
-                    timestamp: data.timestamp,
-                    value: data.value.toString(), // Convert value to string
-                });
-                console.log('Data added to Redis Stream:', data);
+            // Log the data received from the WebSocket client
+            console.log(`Data coming from WebSocket: ${parsedMessage}`);
+            // 1. Store data in Redis Stream
+            console.log(data);
+            yield redis.xAdd('iot-data', '*', {
+                timestamp: data.timestamp,
+                value: data.value.toString(),
+            });
+            console.log('Data added to Redis Stream:', data);
+            {
+                console.warn('Invalid data received from WebSocket:', data);
             }
-            else {
-                console.warn('Invalid data received:', data);
-            }
-            console.log(`Received data from client: ${parsedMessage}`);
+            // Send a message to the client
+            client.send('Message from server');
         }
         catch (err) {
             console.error('Error processing message:', err);
         }
     }));
-    // Send message to client
-    client.send('Message from server');
 });
-// Simple data validation function
-function isValidData(data) {
-    return !!data.timestamp && !!data.value; // Ensure both fields are present
-}
